@@ -219,7 +219,12 @@ def entity_key(
 
     src = re.sub(r"[^a-z0-9_]+", "", (source or "").strip().lower())
     who = (author or "").strip().lower().lstrip("@/")
-    who = re.sub(r"\s+", "_", who)
+    # Reddit hands back authors as '/u/name' and subreddits as '/r/name'. Left
+    # in, the key becomes 'reddit:u/name' while the same person arriving from
+    # the API as 'name' becomes 'reddit:name' — two entities, one human, and the
+    # dedup this function exists for is defeated by a two-character prefix.
+    who = re.sub(r"^(?:u|r|user|profile)/", "", who)
+    who = re.sub(r"[^a-z0-9_.-]+", "_", who).strip("_.-")
     if src and who:
         return f"{src}:{who}"
 

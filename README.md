@@ -3,10 +3,25 @@
 Shared invariants for the WizCodes multi-agent system — the Content Poster, the
 Lead Finder and the Outreach agent.
 
-It lives outside `main_company_folder` on purpose: that workspace's root holds
-agent folders and nothing else, and every agent folder must stay independently
-cloneable. `wizcore` arrives as a pinned dependency, not as a directory an agent
-reaches sideways into.
+## Where it lives, and why the ground rule still holds
+
+It sits inside `main_company_folder` at the owner's direction — kept outside, it
+would be one folder among a couple of hundred on `D:\` and would get lost.
+
+That is a change to the letter of workspace ground rule 1 ("the root holds agent
+folders and nothing else"), so the rule's *purpose* has to be preserved
+deliberately rather than by accident. The purpose was: **an agent folder must be
+independently cloneable and deployable, with nothing beside it.** Two things keep
+that true, and breaking either one breaks the rule for real:
+
+1. `wizcore` is **its own git repo**, not part of any agent's.
+2. Agents depend on it as an **installed package**, never by reaching sideways
+   at runtime. No `sys.path` insert, no `../wizcore` import, no relative file
+   read. The editable install below is a build-out convenience; the pinned git
+   dependency is the production form, and both resolve through pip.
+
+If an agent ever imports `wizcore` by path instead of by install, that folder has
+quietly stopped being cloneable and the rule is gone.
 
 ## The admission test
 
@@ -32,7 +47,7 @@ If something in here stops passing that test, take it out.
 During build-out, editable, from each agent's own venv:
 
 ```powershell
-cd <agent> ; .\.venv\Scripts\python.exe -m pip install -e D:\wizcore
+cd <agent> ; .\.venv\Scripts\python.exe -m pip install -e ..\wizcore
 ```
 
 Modal picks it up with `.add_local_python_source("wizcore")`.

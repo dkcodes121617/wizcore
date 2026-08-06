@@ -17,7 +17,7 @@ import json
 import logging
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 _run_id: contextvars.ContextVar[str] = contextvars.ContextVar("run_id", default="-")
 _agent: contextvars.ContextVar[str] = contextvars.ContextVar("agent", default="-")
@@ -31,7 +31,7 @@ logging.raiseExceptions = False
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "ts": datetime.now(UTC).isoformat(timespec="milliseconds"),
             "level": record.levelname,
             "agent": _agent.get(),
             "run_id": _run_id.get(),

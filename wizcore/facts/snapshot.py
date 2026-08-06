@@ -171,6 +171,29 @@ class FactsSnapshot:
                 names.add(t.company)
         return names
 
+    def facts_corpus(self) -> str:
+        """Every fact as one lowercase blob, for substring checks.
+
+        The grounding gate needs to answer "does this figure appear anywhere in
+        the source data?". Matching against a curated set of numbers would miss
+        anything phrased differently ("1000+" vs "1,000"), so the gate checks
+        the corpus and uses `known_numbers()` only to explain a rejection.
+        """
+        parts: list[str] = [self.brand_name, self.tagline, str(self.countries_served)]
+        parts += [s.get("name", "") + " " + s.get("oneLineDescription", "") for s in self.services]
+        for p in self.projects:
+            parts += [p.name, p.client, p.client_country, p.industry, p.category,
+                      p.description, p.slug, " ".join(p.tech)]
+        for o in self.open_source:
+            parts += [str(o.get("name", "")), str(o.get("description", "")),
+                      str(o.get("downloads", ""))]
+        for t in self.testimonials:
+            parts += [t.name, t.country, t.company, t.role, t.text]
+        for post in self.existing_posts:
+            parts += [post.get("title", ""), post.get("description", ""), post.get("slug", "")]
+        parts.append(self.playbook_excerpt)
+        return " \n".join(x for x in parts if x).lower()
+
     def known_numbers(self) -> set[str]:
         """Every figure that appears in the source data, as written.
 
@@ -322,7 +345,101 @@ def _playbook_sections(playbook: str, budget: int) -> str:
     return "\n\n".join(out) if out else playbook[:budget].strip()
 
 
-# ── extraction helpers (carried over verbatim) ──
+# ── extraction helpers ──
+#
+# CHANGED FROM THE INHERITED VERSION, and the reason matters.
+#
+# The blog agent split these files with `\{[^{}]*?id:\s*'[^']+'[^{}]*?\}` — a
+# flat regex that cannot match an object containing a nested object. Measured
+# against the live site repo on 6 Aug 2026, that found **1 of the 5** entries in
+# `openSource.ts`: only Cartoon Diffusion, silently dropping ClarivueXAI,
+# Bulkhead, Cyber Bug Bounty Agent and Chrome Extensions.
+#
+# (projects, testimonials and posts happened to extract completely — their
+# entries carry no nested objects today. That is luck, not design: the first
+# project entry to gain a nested field would have vanished the same way.)
+#
+# Nothing errors when this happens. The snapshot just quietly claims WizCodes
+# has one open-source project, and the grounding gate then *rejects* a post
+# truthfully mentioning ClarivueXAI while passing anything about the one entry
+# it can see. A grounding check built on a silently incomplete corpus is worse
+# than no check at all, because it is trusted.
+#
+# So the splitter below is brace-balanced and string/comment aware. The field
+# extractors are unchanged — they were never the problem.
+
+
+def _object_blocks(text: str) -> list[str]:
+    """Every balanced top-level `{...}` literal, ignoring strings and comments.
+
+    Depth is counted from zero at the file level, so in the usual
+    `export const x = [ {...}, {...} ]` shape each array element comes back
+    whole, with its nested objects intact inside it.
+    """
+    blocks: list[str] = []
+    depth = 0
+    start = -1
+    i = 0
+    n = len(text)
+    quote = ""          # active string delimiter, or ""
+    comment = ""        # "line" | "block" | ""
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+
+        if comment == "line":
+            if ch == "\n":
+                comment = ""
+        elif comment == "block":
+            if ch == "*" and nxt == "/":
+                comment = ""
+                i += 1
+        elif quote:
+            if ch == "\\":
+                i += 1              # skip the escaped character
+            elif ch == quote:
+                quote = ""
+        elif ch == "/" and nxt == "/":
+            comment = "line"
+            i += 1
+        elif ch == "/" and nxt == "*":
+            comment = "block"
+            i += 1
+        elif ch in "'\"`":
+            quote = ch
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                blocks.append(text[start : i + 1])
+                start = -1
+            elif depth < 0:
+                depth = 0           # unbalanced source: resync rather than crash
+        i += 1
+    return blocks
+
+
+_NESTED_OBJ = re.compile(r"\{[^{}]*\}")
+
+
+def _own_fields(block: str) -> str:
+    """The block with nested *objects* blanked out, arrays preserved.
+
+    A nested `{ ... name: 'x' ... }` would otherwise let a child's field be read
+    as the parent's, which is how a project ends up reporting its sub-object's
+    name. Arrays stay because `tech: [...]` and `tags: [...]` are real fields.
+    """
+    inner = block[1:-1] if block.startswith("{") and block.endswith("}") else block
+    prev = None
+    while prev != inner:                       # collapse innermost outward
+        prev = inner
+        inner = _NESTED_OBJ.sub(" ", inner)
+    return inner
+
+
 def _extract_services(site_ts: str) -> list[dict]:
     services = []
     for m in re.finditer(
@@ -341,8 +458,11 @@ def _extract_scalar(site_ts: str, key: str) -> str:
 def _extract_projects(projects_ts: str) -> list[ProjectFact]:
     """Split the file into object literals and pull durable fields from each."""
     projects: list[ProjectFact] = []
-    for block in re.finditer(r"\{[^{}]*?id:\s*'[^']+'[^{}]*?\}", projects_ts, re.DOTALL):
-        text = block.group(0)
+    seen: set[str] = set()
+    for block in _object_blocks(projects_ts):
+        text = _own_fields(block)
+        if not re.search(r"\bid:\s*'[^']+'", text):
+            continue
         pf = ProjectFact()
         pf.id = _f(text, "id")
         pf.name = _f(text, "name")
@@ -361,20 +481,28 @@ def _extract_projects(projects_ts: str) -> list[ProjectFact]:
         tech_m = re.search(r"tech:\s*\[([^\]]*)\]", text)
         if tech_m:
             pf.tech = [t.strip().strip("'\"") for t in tech_m.group(1).split(",") if t.strip()]
-        if pf.name:
+        if pf.name and pf.id not in seen:
+            seen.add(pf.id)
             projects.append(pf)
     return projects
 
 
 def _extract_open_source(oss_ts: str) -> list[dict]:
-    out = []
-    for block in re.finditer(r"\{[^{}]*?name:\s*'[^']+'[^{}]*?\}", oss_ts, re.DOTALL):
-        text = block.group(0)
+    out, seen = [], set()
+    for block in _object_blocks(oss_ts):
+        text = _own_fields(block)
         name = _f(text, "name")
-        if not name:
+        if not name or name in seen:
             continue
+        seen.add(name)
         out.append(
-            {"name": name, "description": _f(text, "description"), "downloads": _f(text, "downloads")}
+            {
+                "name": name,
+                "description": _multiline_field(text, "description"),
+                "downloads": _f(text, "downloads"),
+                "slug": _f(text, "slug"),
+                "status": _f(text, "status"),
+            }
         )
     return out
 
@@ -386,8 +514,10 @@ def _extract_testimonials(ts: str) -> list[TestimonialFact]:
     this cannot reuse `_f`, which reads single-quoted values.
     """
     out: list[TestimonialFact] = []
-    for block in re.finditer(r"\{[^{}]*?id:\s*\d+[^{}]*?\}", ts, re.DOTALL):
-        text = block.group(0)
+    for block in _object_blocks(ts):
+        text = _own_fields(block)
+        if not re.search(r"\bid:\s*\d+", text):
+            continue
         quote = re.search(r'text:\s*"((?:[^"\\]|\\.)*)"', text)
         name = _f(text, "name")
         if not (name and quote):
@@ -411,12 +541,13 @@ def _f(text: str, key: str) -> str:
 
 
 def _extract_posts(posts_ts: str) -> list[dict]:
-    out = []
-    for block in re.finditer(r"\{[^{}]*?slug:\s*'[^']+'[^{}]*?\}", posts_ts, re.DOTALL):
-        text = block.group(0)
+    out, seen = [], set()
+    for block in _object_blocks(posts_ts):
+        text = _own_fields(block)
         slug = _f(text, "slug")
-        if not slug:
+        if not slug or slug in seen:
             continue
+        seen.add(slug)
         tags_m = re.search(r"tags:\s*\[([^\]]*)\]", text)
         tags = (
             [t.strip().strip("'\"") for t in tags_m.group(1).split(",") if t.strip()]
