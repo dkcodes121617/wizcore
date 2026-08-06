@@ -1,0 +1,64 @@
+# wizcore
+
+Shared invariants for the WizCodes multi-agent system — the Content Poster, the
+Lead Finder and the Outreach agent.
+
+It lives outside `main_company_folder` on purpose: that workspace's root holds
+agent folders and nothing else, and every agent folder must stay independently
+cloneable. `wizcore` arrives as a pinned dependency, not as a directory an agent
+reaches sideways into.
+
+## The admission test
+
+> **Would two copies of this drifting be a _bug_, or just duplication?**
+
+Bug → it belongs here. Duplication → it belongs in the agent.
+
+That test is decidable without asking anyone, and it is the only thing keeping
+this package small enough to stay understandable.
+
+| Here | Why | Stays in the agent |
+|---|---|---|
+| `db/identity.py` — `entity_key()` | Drift means the same business is pitched twice, silently. No exception fires. | `platforms/facebook.py` — one agent publishes |
+| `llm/` — the proxy client | Drift means a 403 nobody can explain six months later | `assess/psi.py` — one agent assesses |
+| `facts/` — the site snapshot | Drift means one agent inventing a client in public | `prompts/library.py` — each agent's own voice |
+| `db/` — conn, runs, actions, spend | One DB contract, one run log, one idempotency ledger, one budget | Telegram *message formatting* — per agent |
+| `telegram/send.py` — transport only | One bot | everything else |
+
+If something in here stops passing that test, take it out.
+
+## Install
+
+During build-out, editable, from each agent's own venv:
+
+```powershell
+cd <agent> ; .\.venv\Scripts\python.exe -m pip install -e D:\wizcore
+```
+
+Modal picks it up with `.add_local_python_source("wizcore")`.
+
+Once it stabilises, tag it and switch each agent's `requirements.txt` to the
+pinned form — pinned by tag, never floating, because a scheduled agent nobody is
+watching must not be surprised by an upstream change:
+
+```
+wizcore @ git+https://github.com/dkcodes121617/wizcore@v0.1.0
+```
+
+## The rule that came over from `core_sync.py`
+
+**Never edit anything here to suit one agent.** A specific need is a new module
+in that agent's own package. This rule is the valuable part of the mechanism
+this package replaces.
+
+## Layout
+
+```
+wizcore/
+├─ config.py      load_env + the _clean() dotenv-comment fix + typed getters
+├─ llm/           client.py (the proxy's quirks) · sanitize.py
+├─ facts/         snapshot.py · site.py (GitHub Contents API reader)
+├─ db/            conn.py · identity.py · runs.py · actions.py · spend.py
+├─ telegram/      send.py  (send-only: no webhook, no callbacks)
+└─ obs/           log.py   (JSON lines, every record carrying run_id)
+```

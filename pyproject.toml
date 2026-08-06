@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wizcore"
+version = "0.1.0"
+description = "Shared invariants for the WizCodes multi-agent system."
+requires-python = ">=3.11"
+
+# Deliberately small. Everything here is either a hard-won integration detail
+# (the proxy's headers and retry shape) or a value that MUST be computed
+# identically in two different processes (entity_key). Nothing is here just to
+# avoid typing it twice — see README.md for the admission test.
+dependencies = [
+    "requests>=2.32.0",
+    "tenacity>=9.0.0",
+    "python-dotenv>=1.0.1",
+    "psycopg[binary,pool]>=3.2.0",
+    # entity_key's registrable-domain extraction. Required, not optional: an
+    # optional dependency that only fails at runtime inside one agent is exactly
+    # the class of bug this package exists to prevent.
+    "tldextract>=5.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.8.0"]
+
+[tool.setuptools.packages.find]
+include = ["wizcore*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
