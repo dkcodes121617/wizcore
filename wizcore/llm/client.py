@@ -201,7 +201,7 @@ class LLMClient:
         last_err: Exception | None = None
         for i in range(attempts):
             raw = self.complete(system=sys, user=user, max_tokens=max_tokens, model=model)
-            parsed = _extract_json(raw)
+            parsed = extract_json(raw)
             if parsed is not None:
                 return parsed
             last_err = ValueError(f"unparseable JSON: {raw[:200]!r}")
@@ -222,8 +222,15 @@ class LLMClient:
             return False, repr(e)
 
 
-def _extract_json(text: str):
-    """Best-effort JSON extraction: whole string, or the first {...}/[...] block."""
+def extract_json(text: str):
+    """Best-effort JSON extraction: whole string, or the first {...}/[...] block.
+
+    Public because it is needed for EVERY provider, not just this one. Measured
+    across the proxy's models and Groq: **no model returned bare JSON** — all of
+    them fenced it — so any caller parsing model output needs this, and three
+    agents writing three fence-strippers would be three chances to get the
+    balanced-bracket walk subtly wrong.
+    """
     text = text.strip()
     # Strip a ```json fence if present.
     fence = re.match(r"^```[a-zA-Z]*\s*(.*?)\s*```$", text, re.DOTALL)
