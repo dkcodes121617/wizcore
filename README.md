@@ -60,6 +60,25 @@ watching must not be surprised by an upstream change:
 wizcore @ git+https://github.com/dkcodes121617/wizcore@v0.1.0
 ```
 
+## Configuration
+
+`wizcore` reads no config of its own — it reads the **calling agent's**
+environment, loaded by `wizcore.config.load_env(AGENT_ROOT)`. These are the
+variables it touches:
+
+| Variable | Used by | Notes |
+|---|---|---|
+| `NEON_DATABASE_URL` | `db/*` | the message bus; required by everything except `llm` and `facts` |
+| `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` | `llm` | the proxy |
+| `ANTHROPIC_MODEL` | `llm` | default model when a caller does not pass one |
+| `SITE_REPO` / `SITE_READ_TOKEN` | `facts` | read-only PAT (Contents: Read) |
+| `SITE_LOCAL_DIR` | `facts` | optional; point at a local `wizcodes_next` checkout to skip the API entirely |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | `telegram` | send-only |
+| `TELEGRAM_TOPIC_*` | `telegram` | optional forum topics; blank falls back to the main chat |
+
+Nothing here is read at import time, so importing `wizcore` in a context with
+no environment is safe.
+
 ## The rule that came over from `core_sync.py`
 
 **Never edit anything here to suit one agent.** A specific need is a new module

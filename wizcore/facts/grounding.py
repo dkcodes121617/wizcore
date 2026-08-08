@@ -70,11 +70,34 @@ _NOT_A_CLIENT = {
 }
 
 
-def check(text: str, snapshot) -> list[str]:
-    """Return a list of reasons the text is not grounded. Empty means it passes."""
+def check(text: str, snapshot, sources: list | None = None) -> list[str]:
+    """Reasons the text is not grounded. Empty means it passes.
+
+    ## Two corpora, two rules, one gate
+
+    Timely content breaks the original single-corpus rule, and relaxing the rule
+    would trade the system's best safety property for reach. So the gate splits
+    by *what the claim is about* instead:
+
+    | Claim about | Must trace to | Rule |
+    |---|---|---|
+    | **WizCodes** — our projects, clients, results | the site-repo snapshot | absolute, unchanged |
+    | **the world** — anyone else's product or statistic | a captured source extract | must exist, and be cited |
+
+    `sources` is a list of captured evidence — anything with an `extract`
+    attribute or key, typically `content.trend_sources` rows. Pass it and an
+    external figure becomes publishable *if and only if* it appears in
+    something we actually fetched and stored.
+
+    Note the direction: with no `sources`, behaviour is exactly as before —
+    every external figure is rejected. Supplying sources does not weaken the
+    gate, it gives a legitimate way to satisfy it. An uncited external number is
+    still rejected, exactly as an invented WizCodes number is.
+    """
     reasons: list[str] = []
     corpus = snapshot.facts_corpus()
     known = {n.lower() for n in snapshot.known_names()}
+    cited = _source_corpus(sources)
 
     for raw in _CLAIM_NUMBER.findall(text):
         figure = raw.strip()
@@ -89,11 +112,15 @@ def check(text: str, snapshot) -> list[str]:
             digits,
             f"{int(digits):,}" if digits.isdigit() and len(digits) > 3 else digits,
         }
-        if not any(v in corpus for v in variants if v):
-            reasons.append(
-                f"figure {figure!r} does not appear anywhere in the site facts - "
-                "every number must come from the repo"
-            )
+        if any(v in corpus for v in variants if v):
+            continue
+        if cited and any(v in cited for v in variants if v):
+            continue    # substantiated by a captured source
+        reasons.append(
+            f"figure {figure!r} appears in neither the site facts nor any captured "
+            "source - every number must trace to the repo or to something we fetched"
+            + (" and stored" if cited else " (no sources were supplied)")
+        )
 
     for name in set(_PROPER_NOUN.findall(text)):
         if name in _NOT_A_CLIENT or len(name) < 4:
@@ -103,11 +130,60 @@ def check(text: str, snapshot) -> list[str]:
         if name.lower() in corpus or name.lower() in known:
             continue
         if _looks_like_our_claim(text, name):
+            # Deliberately NOT satisfiable by a captured source. A third party's
+            # press release can substantiate "their product does X"; nothing
+            # external can substantiate "we built X". That claim can only come
+            # from our own repo, so this branch stays single-corpus forever.
             reasons.append(
                 f"{name!r} is presented as a WizCodes project or client but is not "
                 "in the site repo"
             )
     return reasons
+
+
+def _source_corpus(sources: list | None) -> str:
+    """Flatten captured evidence into one lowercase blob for substring checks.
+
+    Accepts dicts (database rows) or objects with an `extract`, so a caller can
+    pass `content.trend_sources` rows straight through without shaping them.
+    """
+    if not sources:
+        return ""
+    parts: list[str] = []
+    for source in sources:
+        for field in ("extract", "title", "publisher"):
+            value = (
+                source.get(field) if isinstance(source, dict)
+                else getattr(source, field, None)
+            )
+            if value:
+                parts.append(str(value))
+    return " \n".join(parts).lower()
+
+
+def uncited_claims(text: str, snapshot, sources: list | None = None) -> list[str]:
+    """The figures in `text` that no source substantiates.
+
+    Same detection as `check`, but returns the offending figures rather than
+    prose. The angle synthesiser uses this to decide what still needs a source
+    fetched, which is how "capture what you need to cite" becomes a loop the
+    system can close on its own instead of a rule someone has to follow.
+    """
+    corpus = snapshot.facts_corpus()
+    cited = _source_corpus(sources)
+    missing: list[str] = []
+    for raw in _CLAIM_NUMBER.findall(text):
+        figure = raw.strip()
+        digits = re.sub(r"[^\d]", "", figure)
+        if not digits or digits in _SAFE_NUMBERS or _YEAR.match(digits):
+            continue
+        variants = {figure.lower(), digits}
+        if any(v in corpus for v in variants if v):
+            continue
+        if cited and any(v in cited for v in variants if v):
+            continue
+        missing.append(figure)
+    return missing
 
 
 def _looks_like_our_claim(text: str, name: str) -> bool:
