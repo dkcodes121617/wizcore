@@ -39,6 +39,7 @@ PROJECTS = "src/data/projects.ts"
 OPEN_SOURCE = "src/data/openSource.ts"
 TESTIMONIALS = "src/data/testimonials.ts"
 POSTS_REGISTRY = "src/content/blog/posts.ts"
+SOCIAL_STATS = "src/data/socialStats.ts"
 PLAYBOOK = "details.md"
 
 
@@ -85,6 +86,10 @@ class FactsSnapshot:
     open_source: list[dict] = field(default_factory=list)   # {name, description, downloads}
     testimonials: list[TestimonialFact] = field(default_factory=list)
     existing_posts: list[dict] = field(default_factory=list)  # {slug, title, description, tags}
+    # Figures a chart may draw. {id, label, value, unit, scope, source, ...}
+    # `scope` is 'ours' (derived from this repo) or 'industry' (someone else's
+    # published figure, which must carry an attribution to be usable at all).
+    curated_stats: list[dict] = field(default_factory=list)
     playbook_excerpt: str = ""
 
     # ── derived, and derived the same way the site derives it ──
@@ -191,7 +196,89 @@ class FactsSnapshot:
             parts += [t.name, t.country, t.company, t.role, t.text]
         for post in self.existing_posts:
             parts += [post.get("title", ""), post.get("description", ""), post.get("slug", "")]
+        # Chart values live here too, or the grounding gate would reject the
+        # very figures the curated file exists to authorise.
+        for stat in self.curated_stats:
+            parts += [str(stat.get("value", "")), str(stat.get("label", "")),
+                      str(stat.get("source", ""))]
         parts.append(self.playbook_excerpt)
+        return " \n".join(x for x in parts if x).lower()
+
+    def chartable_stats(self) -> list[dict]:
+        """Curated stats that are safe to publish.
+
+        Three ways a stat is dropped, and all three are silent by design — an
+        unusable stat means one fewer chart, never a failed run:
+
+          * no readable value (an identifier this reader could not resolve)
+          * an `industry` figure with no publisher or no URL, which would be
+            published uncited — the same rule the trend layer applies to any
+            external number, applied to a hand-maintained file
+          * anything else with no label to put under it
+
+        Our own figures need no attribution because the repo *is* the
+        attribution.
+        """
+        out = []
+        for stat in self.curated_stats:
+            if stat.get("value") is None or not stat.get("label"):
+                continue
+            if stat.get("scope") == "ours":
+                out.append(stat)
+            elif stat.get("source") and stat.get("source_url"):
+                out.append(stat)
+        return out
+
+    def stats_block(self) -> str:
+        """The chartable figures, as a prompt block. Empty when there are none.
+
+        Empty is a normal state and the caller must handle it: with no stats
+        the chart recipes are simply not eligible, which is the correct
+        behaviour and much better than a model filling in plausible numbers.
+        """
+        stats = self.chartable_stats()
+        if not stats:
+            return ""
+        lines = [
+            "FIGURES YOU MAY PUT IN A CHART (these and no others - a chart value",
+            "that does not appear here is rejected exactly like an invented",
+            "statistic in prose):",
+        ]
+        for s in stats:
+            cite = ""
+            if s.get("scope") == "industry":
+                cite = f"  [source: {s.get('source')}, {s.get('as_of', 'undated')}]"
+            lines.append(f"  - {s['value']}{s.get('unit', '')} {s.get('label', '')}{cite}")
+        return "\n".join(lines)
+
+    def numbers_corpus(self) -> str:
+        """The corpus a published FIGURE may come from — narrower than `facts_corpus`.
+
+        Everything except `playbook_excerpt`, and that exclusion is the whole
+        point. `details.md` is 71 KB of brand, voice and SEO guidance, and it is
+        full of incidental numbers: section numbers, word-count targets, worked
+        examples. Including it put **108 of 121** numbers in the grounding
+        corpus, among them 47, 15 and 78 — so "we increased conversions by 47%"
+        and "commissions dropped to 15%" both passed a gate whose entire purpose
+        is to stop them. Measured, not theorised: `tools/e2e.py` caught both.
+
+        Names still check against the full corpus. A project mentioned only in
+        the playbook is a real project; a number mentioned only there is not a
+        publishable fact.
+        """
+        parts: list[str] = [str(self.countries_served), str(len(self.testimonials))]
+        if self.founding_year:
+            parts.append(self.founding_year)
+        for p in self.projects:
+            parts.append(p.description)
+        for o in self.open_source:
+            parts += [str(o.get("downloads", "")), str(o.get("description", ""))]
+        for t in self.testimonials:
+            parts.append(t.text)
+        for post in self.existing_posts:
+            parts += [post.get("title", ""), post.get("description", "")]
+        for stat in self.curated_stats:
+            parts.append(str(stat.get("value", "")))
         return " \n".join(x for x in parts if x).lower()
 
     def known_numbers(self) -> set[str]:
@@ -540,6 +627,55 @@ def _f(text: str, key: str) -> str:
     return m.group(1) if m else ""
 
 
+def _extract_curated_stats(stats_ts: str) -> list[dict]:
+    """Figures a chart may draw, from `src/data/socialStats.ts`.
+
+    Two shapes of `value` have to survive here, and only one of them is a
+    number in the source text:
+
+        value: 26,                  a literal
+        value: countriesServed,     an identifier computed by the site
+
+    The identifier form is the *preferred* one — it is what stops a chart
+    contradicting the same figure printed on the website — and this reader never
+    executes TypeScript, so it cannot resolve it. Such a stat is returned with
+    `value: None` and a `ref`, and the caller drops it: a chart is better absent
+    than drawn from a number nobody can check.
+
+    That is why `chartable_stats()` filters. A stat whose value cannot be read
+    is exactly as unusable as one with no source.
+    """
+    out: list[dict] = []
+    for block in _object_blocks(stats_ts):
+        text = _own_fields(block)
+        stat_id = _f(text, "id")
+        if not stat_id:
+            continue
+        raw = re.search(r"\bvalue:\s*([^,\n]+)", text)
+        literal = None
+        ref = ""
+        if raw:
+            token = raw.group(1).strip()
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", token):
+                literal = float(token) if "." in token else int(token)
+            else:
+                ref = token
+        out.append(
+            {
+                "id": stat_id,
+                "label": _f(text, "label"),
+                "value": literal,
+                "ref": ref,
+                "unit": _f(text, "unit"),
+                "scope": _f(text, "scope") or "ours",
+                "source": _f(text, "source"),
+                "source_url": _f(text, "sourceUrl"),
+                "as_of": _f(text, "asOf"),
+            }
+        )
+    return out
+
+
 def _extract_posts(posts_ts: str) -> list[dict]:
     out, seen = [], set()
     for block in _object_blocks(posts_ts):
@@ -572,6 +708,33 @@ def _multiline_field(text: str, key: str) -> str:
     return m.group(1) if m else _f(text, key)
 
 
+# `socialStats.ts` derives its own figures from the site's data rather than
+# hardcoding them, which is the property that stops a chart contradicting the
+# number printed on the website. The cost is that the values are identifiers,
+# and this reader never executes TypeScript.
+#
+# So the handful of identifiers it uses are resolved here, from the same two
+# sources the site derives them from. That is not a workaround — `stats.ts`
+# already computes `countriesServed` exactly this way, and `served_countries`
+# above already mirrors it for the same reason. An identifier not in this map
+# resolves to None and its stat is dropped, which is the safe direction:
+# a chart is better absent than drawn from a number nobody can check.
+def _resolve_stat_refs(stats: list[dict], snap: FactsSnapshot) -> list[dict]:
+    known = {
+        "countriesServed": snap.countries_served,
+        "servedCountries.length": snap.countries_served,
+        "allWork.length": len(snap.projects),
+        "projectCount": len(snap.projects),
+        "clientCount": len(snap.testimonials),
+        "testimonials.length": len(snap.testimonials),
+        "openSourceProjects.length": len(snap.open_source),
+    }
+    for stat in stats:
+        if stat.get("value") is None and stat.get("ref"):
+            stat["value"] = known.get(stat["ref"])
+    return stats
+
+
 def build_snapshot(reader: SiteReader | None = None) -> FactsSnapshot:
     """Build the snapshot. One `SiteReader` per run — it caches."""
     reader = reader or SiteReader()
@@ -581,7 +744,7 @@ def build_snapshot(reader: SiteReader | None = None) -> FactsSnapshot:
     # answer without knowing how the registry happens to be ordered.
     posts.sort(key=lambda p: p.get("date", ""), reverse=True)
 
-    return FactsSnapshot(
+    snapshot = FactsSnapshot(
         brand_name=_extract_scalar(site_ts, "brandName") or "WizCodes",
         tagline=_extract_scalar(site_ts, "tagline"),
         url=_extract_scalar(site_ts, "url") or "https://wizcodes.site",
@@ -597,6 +760,12 @@ def build_snapshot(reader: SiteReader | None = None) -> FactsSnapshot:
         existing_posts=posts,
         playbook_excerpt=reader.read(PLAYBOOK),
     )
+    # After construction, because resolving `countriesServed` needs the projects
+    # and testimonials that were just read.
+    snapshot.curated_stats = _resolve_stat_refs(
+        _extract_curated_stats(reader.read(SOCIAL_STATS)), snapshot
+    )
+    return snapshot
 
 
 if __name__ == "__main__":

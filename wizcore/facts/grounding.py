@@ -20,13 +20,24 @@ mean one agent silently permitting what the other rejects.
 Its inputs come from `wizcore.facts.snapshot`, which is already here, so nothing
 about the move added a dependency.
 
-## Why it checks the corpus rather than a list of allowed numbers
+## How a figure is matched, and why it is by TOKEN not by substring
 
-A curated set would miss the same figure written differently — "1000+" against
-"1,000", "11 countries" against "11". So the check asks whether the digits
-appear *anywhere* in the source data, and only uses the curated set to explain a
-rejection. Generous on purpose: the target is an invented "we increased
-conversions by 47%", not "3 steps".
+A curated list of allowed numbers would miss the same figure written differently
+— "1000+" against "1,000", "under 200ms" against "<200ms". So the corpus is the
+authority, and a draft's figure is grounded when it matches a number that
+actually appears in it.
+
+The first version asked whether the digits appeared *anywhere* in the corpus, as
+a substring. Against 26 projects, 13 testimonials and a 70 KB playbook that is
+not a weak check, it is **no check at all for any short figure**: "15%" passes
+because "15" occurs inside some unrelated "2015" or "1500", and so does almost
+every other two-digit number. Measured — `tools/e2e.py` found both
+"commissions dropped to 15%" and a bar chart of invented percentages passing a
+gate whose entire purpose is to stop exactly those.
+
+So the corpus is tokenised once into the set of numbers it contains, and a
+figure has to equal one of them after normalising away separators, currency and
+units. Still generous about *format*, and no longer generous about arithmetic.
 """
 from __future__ import annotations
 
@@ -70,6 +81,28 @@ _NOT_A_CLIENT = {
 }
 
 
+# Any run of digits with optional separators. Tokenising the corpus with this
+# and comparing digit strings is what makes "1,000" and "1000" the same fact and
+# "15" and "2015" different ones.
+_NUMBER_TOKEN = re.compile(r"\d[\d,.\s]*\d|\d")
+
+
+def _number_set(corpus: str) -> set[str]:
+    """Every number the corpus contains, as bare digit strings.
+
+    Both with and without a trailing zero-group, so "1.5" contributes "15" and
+    "1.5" contributes "15" — the point is that "1,240" and "1240" and "1 240"
+    all reduce to the same key while "15" never reduces to "1500".
+    """
+    out: set[str] = set()
+    for raw in _NUMBER_TOKEN.findall(corpus):
+        digits = re.sub(r"[^\d]", "", raw)
+        if digits:
+            out.add(digits)
+            out.add(digits.lstrip("0") or "0")
+    return out
+
+
 def check(text: str, snapshot, sources: list | None = None) -> list[str]:
     """Reasons the text is not grounded. Empty means it passes.
 
@@ -98,23 +131,25 @@ def check(text: str, snapshot, sources: list | None = None) -> list[str]:
     corpus = snapshot.facts_corpus()
     known = {n.lower() for n in snapshot.known_names()}
     cited = _source_corpus(sources)
+    # Figures check against the NARROWER corpus. `facts_corpus()` includes the
+    # 71 KB brand playbook, whose incidental numbers made almost every two-digit
+    # figure look grounded. Names still use the full corpus — a project
+    # mentioned only in the playbook is real; a number there is not a fact.
+    corpus_numbers = _number_set(snapshot.numbers_corpus())
+    cited_numbers = _number_set(cited) if cited else set()
 
     for raw in _CLAIM_NUMBER.findall(text):
         figure = raw.strip()
         digits = re.sub(r"[^\d]", "", figure)
         if not digits or digits in _SAFE_NUMBERS or _YEAR.match(digits):
             continue
-        # Try the figure as written, then bare digits, then with thousands
-        # separators — "1,000" in a draft against "1000" in the source is the
-        # same fact and must not be rejected.
-        variants = {
-            figure.lower(),
-            digits,
-            f"{int(digits):,}" if digits.isdigit() and len(digits) > 3 else digits,
-        }
-        if any(v in corpus for v in variants if v):
+        # Compared as a whole number, not as a substring. "1,000" in a draft
+        # against "1000" in the source is the same fact; "15" against "2015" is
+        # not, and the substring version could not tell them apart.
+        variants = {digits, digits.lstrip("0") or "0"}
+        if variants & corpus_numbers:
             continue
-        if cited and any(v in cited for v in variants if v):
+        if cited_numbers and variants & cited_numbers:
             continue    # substantiated by a captured source
         reasons.append(
             f"figure {figure!r} appears in neither the site facts nor any captured "
@@ -169,21 +204,39 @@ def uncited_claims(text: str, snapshot, sources: list | None = None) -> list[str
     fetched, which is how "capture what you need to cite" becomes a loop the
     system can close on its own instead of a rule someone has to follow.
     """
-    corpus = snapshot.facts_corpus()
-    cited = _source_corpus(sources)
+    corpus_numbers = _number_set(snapshot.numbers_corpus())
+    cited_numbers = _number_set(_source_corpus(sources))
     missing: list[str] = []
     for raw in _CLAIM_NUMBER.findall(text):
         figure = raw.strip()
         digits = re.sub(r"[^\d]", "", figure)
         if not digits or digits in _SAFE_NUMBERS or _YEAR.match(digits):
             continue
-        variants = {figure.lower(), digits}
-        if any(v in corpus for v in variants if v):
-            continue
-        if cited and any(v in cited for v in variants if v):
+        # Token-matched, exactly as in `check`. These two must agree: the angle
+        # synthesiser uses this to decide which figures still need a source
+        # fetched, and if it disagreed with the gate it would either fetch
+        # sources nothing needed or ship a post the gate then rejects.
+        variants = {digits, digits.lstrip("0") or "0"}
+        if variants & corpus_numbers or (cited_numbers and variants & cited_numbers):
             continue
         missing.append(figure)
     return missing
+
+
+# A capital letter inside the word — CuePilot, ClarivueXAI, TinyTalkHub. This is
+# what a product name looks like and an ordinary word does not.
+_CAMEL = re.compile(r"[a-z][A-Z]")
+
+# The tight constructions that actually assert ownership. Used for ordinary
+# capitalised words, where the wide window below produces false positives.
+_OWNED = (
+    r"our\s+(?:client|customer|project|product|app|platform|tool|work\s+(?:for|with))\s+"
+    r"(?:the\s+)?{name}"
+    r"|we\s+(?:built|made|shipped|launched|created|developed|designed|delivered)\s+"
+    r"(?:the\s+|a\s+|an\s+)?{name}"
+    r"|{name}\s*,?\s+(?:is\s+)?(?:our|one\s+of\s+our)\s+"
+    r"(?:client|customer|project|product|app|platform)"
+)
 
 
 def _looks_like_our_claim(text: str, name: str) -> bool:
@@ -191,11 +244,28 @@ def _looks_like_our_claim(text: str, name: str) -> bool:
 
     Without this the gate would flag every capitalised word in an example, and a
     gate that rejects good posts gets turned off.
+
+    ## Two widths, because two kinds of word carry different evidence
+
+    A **CamelCase** name is a product name almost by definition, so anywhere
+    within a sentence of "we / our" is enough to treat it as a claim.
+
+    An **ordinary capitalised word** is usually a place, a sentence-initial
+    verb, or a common noun. Measured against a review sweep, the wide window
+    rejected two perfectly good posts: `Denver` in "a clinic in Denver" and
+    `Confirms` at the start of a sentence. Neither claims anything about us, and
+    both cost a published post.
+
+    So an ordinary word has to sit in a construction that actually asserts
+    ownership — "our client X", "we built X", "X is one of our projects". That
+    is narrower, and the thing it stops catching was never a real claim.
     """
-    window = re.search(
-        r"(?:we|our|us|wizcodes)\b[^.!?]{0,80}\b" + re.escape(name)
-        + r"|" + re.escape(name) + r"\b[^.!?]{0,60}\b(?:we|our|us|wizcodes)\b",
-        text,
-        re.I,
-    )
-    return bool(window)
+    quoted = re.escape(name)
+    if _CAMEL.search(name):
+        window = (
+            rf"(?:we|our|us|wizcodes)\b[^.!?]{{0,80}}\b{quoted}"
+            rf"|{quoted}\b[^.!?]{{0,60}}\b(?:we|our|us|wizcodes)\b"
+        )
+    else:
+        window = _OWNED.format(name=quoted)
+    return bool(re.search(window, text, re.I))
