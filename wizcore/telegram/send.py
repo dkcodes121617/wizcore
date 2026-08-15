@@ -49,8 +49,46 @@ def _token() -> str:
     return env_str("TELEGRAM_BOT_TOKEN")
 
 
+def _chats() -> list[str]:
+    """Every recipient. `TELEGRAM_CHAT_ID` accepts a comma-separated list.
+
+    One value stays one value, so nothing that already works changes. A second
+    id means a second person sees the same message at the same time, which is
+    what "tell me and my colleague" actually needs — forwarding is not a
+    notification, and a bot cannot add itself to somebody's chat.
+
+    Both parties must have STARTED the bot (Telegram refuses to message a user
+    who has not). A dead id is skipped with a warning rather than failing the
+    send, so one person leaving cannot silence the other.
+    """
+    raw = env_str("TELEGRAM_CHAT_ID")
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
 def _chat() -> str:
-    return env_str("TELEGRAM_CHAT_ID")
+    """The first recipient. Kept for callers that genuinely need one id."""
+    chats = _chats()
+    return chats[0] if chats else ""
+
+
+def _fan_out(method: str, payload: dict, files: dict | None = None) -> bool:
+    """Send one message to every recipient. True if any of them received it.
+
+    Any, not all: a bot blocked by one person must still reach the other. The
+    alternative is that one muted chat silences the whole system.
+    """
+    chats = _chats()
+    if not chats:
+        log.warning("TELEGRAM_CHAT_ID is not set; message dropped")
+        return False
+    sent = False
+    for chat in chats:
+        try:
+            _post(method, {**payload, "chat_id": chat}, files)
+            sent = True
+        except Exception:
+            log.warning("telegram %s failed for chat %s", method, chat, exc_info=True)
+    return sent
 
 
 def _topic(name: str) -> str:
@@ -124,7 +162,6 @@ def send(text: str, topic: str = "", dry_run: bool = False, silent: bool = False
         text = "🧪 <b>DRY RUN</b> - nothing was published or sent\n\n" + text
 
     payload_base = {
-        "chat_id": _chat(),
         "parse_mode": "HTML",
         "link_preview_options": '{"is_disabled": true}',
         "disable_notification": silent,
@@ -133,16 +170,13 @@ def send(text: str, topic: str = "", dry_run: bool = False, silent: bool = False
     if thread:
         payload_base["message_thread_id"] = thread
 
-    try:
-        for i, chunk in enumerate(_chunks(text)):
-            payload = dict(payload_base, text=chunk)
-            if i:
-                payload["disable_notification"] = True   # only the first pings
-            _post("sendMessage", payload)
-        return True
-    except Exception:  # noqa: BLE001
-        log.error("telegram send failed", exc_info=True)
-        return False
+    ok = False
+    for i, chunk in enumerate(_chunks(text)):
+        payload = dict(payload_base, text=chunk)
+        if i:
+            payload["disable_notification"] = True   # only the first pings
+        ok = _fan_out("sendMessage", payload) or ok
+    return ok
 
 
 def _chunks(text: str) -> list[str]:
@@ -180,7 +214,6 @@ def send_photo(photo_url: str, caption: str = "", topic: str = "", dry_run: bool
     if dry_run:
         caption = "🧪 DRY RUN - not published\n" + caption
     payload = {
-        "chat_id": _chat(),
         "photo": photo_url,
         "caption": caption[:1024],     # captions cap lower than messages
         "parse_mode": "HTML",
@@ -188,12 +221,7 @@ def send_photo(photo_url: str, caption: str = "", topic: str = "", dry_run: bool
     thread = _topic(topic) if topic else ""
     if thread:
         payload["message_thread_id"] = thread
-    try:
-        _post("sendPhoto", payload)
-        return True
-    except Exception:  # noqa: BLE001
-        log.error("telegram photo failed", exc_info=True)
-        return False
+    return _fan_out("sendPhoto", payload)
 
 
 def send_album(photo_urls: list[str], caption: str = "", topic: str = "",
@@ -212,16 +240,11 @@ def send_album(photo_urls: list[str], caption: str = "", topic: str = "",
             item["caption"] = caption[:1024]
             item["parse_mode"] = "HTML"
         media.append(item)
-    payload = {"chat_id": _chat(), "media": _json.dumps(media)}
+    payload = {"media": _json.dumps(media)}
     thread = _topic(topic) if topic else ""
     if thread:
         payload["message_thread_id"] = thread
-    try:
-        _post("sendMediaGroup", payload)
-        return True
-    except Exception:  # noqa: BLE001
-        log.error("telegram album failed", exc_info=True)
-        return False
+    return _fan_out("sendMediaGroup", payload)
 
 
 def alert(agent: str, exc: BaseException, context: str = "") -> bool:
