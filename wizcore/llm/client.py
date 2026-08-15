@@ -1,4 +1,4 @@
-"""Client for the Claude-compatible proxy (ClaudeStore).
+"""Client for the Claude-compatible proxy (LLMsRelay; ClaudeStore until 2026-08-16).
 
 Seeded verbatim from the blog agent, which is where these details were learned.
 This is the ONE copy — ground rule 8. Six re-implementations of the same quirks
@@ -72,7 +72,7 @@ class LLMClient:
         chances to parse it differently.
         """
         self.base_url = (
-            base_url or env_str("ANTHROPIC_BASE_URL", "https://api3.claudestore.store")
+            base_url or env_str("ANTHROPIC_BASE_URL", "https://api.llmsrelay.com")
         ).rstrip("/")
         self.api_key = api_key or env_str("ANTHROPIC_API_KEY")
         self.model = model or env_str("ANTHROPIC_MODEL", "claude-sonnet-4.6")

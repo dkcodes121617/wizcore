@@ -1,6 +1,6 @@
 """Output sanitisation for proxy-generated text.
 
-Two problems observed while testing the ClaudeStore proxy:
+Two problems observed while testing the proxy (as ClaudeStore, pre-2026-08-16):
   1. Occasional mojibake — curly quotes / em-dashes arrive as U+FFFD ('�') or
      mis-encoded bytes.
   2. MDX prose forbids raw '<' and '{' (the MDX parser treats them as JSX). The
