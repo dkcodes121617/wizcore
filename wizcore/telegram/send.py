@@ -49,20 +49,35 @@ def _token() -> str:
     return env_str("TELEGRAM_BOT_TOKEN")
 
 
-def _chats() -> list[str]:
-    """Every recipient. `TELEGRAM_CHAT_ID` accepts a comma-separated list.
+def _split(raw: str) -> list[str]:
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def _chats(audience: str = "") -> list[str]:
+    """Recipients for one message. `TELEGRAM_CHAT_ID` accepts a comma list.
 
     One value stays one value, so nothing that already works changes. A second
     id means a second person sees the same message at the same time, which is
     what "tell me and my colleague" actually needs — forwarding is not a
     notification, and a bot cannot add itself to somebody's chat.
 
+    `audience` adds the people who should see *only that kind* of message, from
+    `TELEGRAM_CHAT_ID_<AUDIENCE>`. Someone helping with the posting should get
+    the day's plan, what went out and what needs doing by hand — and should not
+    get lead scores, prospect names or stack traces. Opt-in per message is what
+    makes that true by default: a new alert added later reaches the owner only,
+    because it has to name an audience to reach anyone else.
+
     Both parties must have STARTED the bot (Telegram refuses to message a user
     who has not). A dead id is skipped with a warning rather than failing the
     send, so one person leaving cannot silence the other.
     """
-    raw = env_str("TELEGRAM_CHAT_ID")
-    return [c.strip() for c in raw.split(",") if c.strip()]
+    ids = _split(env_str("TELEGRAM_CHAT_ID"))
+    if audience:
+        ids += _split(env_str(f"TELEGRAM_CHAT_ID_{audience.upper()}"))
+    # Dedupe, keeping order: the owner listed in both must not get two copies.
+    seen: set[str] = set()
+    return [c for c in ids if not (c in seen or seen.add(c))]
 
 
 def _chat() -> str:
@@ -71,13 +86,14 @@ def _chat() -> str:
     return chats[0] if chats else ""
 
 
-def _fan_out(method: str, payload: dict, files: dict | None = None) -> bool:
+def _fan_out(method: str, payload: dict, files: dict | None = None,
+             audience: str = "") -> bool:
     """Send one message to every recipient. True if any of them received it.
 
     Any, not all: a bot blocked by one person must still reach the other. The
     alternative is that one muted chat silences the whole system.
     """
-    chats = _chats()
+    chats = _chats(audience)
     if not chats:
         log.warning("TELEGRAM_CHAT_ID is not set; message dropped")
         return False
@@ -149,7 +165,8 @@ def enabled() -> bool:
     return bool(_token() and _chat()) and env_bool("TELEGRAM_ENABLED", True)
 
 
-def send(text: str, topic: str = "", dry_run: bool = False, silent: bool = False) -> bool:
+def send(text: str, topic: str = "", dry_run: bool = False, silent: bool = False,
+         audience: str = "") -> bool:
     """Send a message, chunked to Telegram's limit. Returns False if disabled.
 
     Never raises on a delivery failure: a notification that takes down the run it
@@ -175,7 +192,7 @@ def send(text: str, topic: str = "", dry_run: bool = False, silent: bool = False
         payload = dict(payload_base, text=chunk)
         if i:
             payload["disable_notification"] = True   # only the first pings
-        ok = _fan_out("sendMessage", payload) or ok
+        ok = _fan_out("sendMessage", payload, audience=audience) or ok
     return ok
 
 
@@ -208,7 +225,8 @@ def _chunks(text: str) -> list[str]:
     return out
 
 
-def send_photo(photo_url: str, caption: str = "", topic: str = "", dry_run: bool = False) -> bool:
+def send_photo(photo_url: str, caption: str = "", topic: str = "",
+               dry_run: bool = False, audience: str = "") -> bool:
     if not enabled():
         return False
     if dry_run:
@@ -221,11 +239,11 @@ def send_photo(photo_url: str, caption: str = "", topic: str = "", dry_run: bool
     thread = _topic(topic) if topic else ""
     if thread:
         payload["message_thread_id"] = thread
-    return _fan_out("sendPhoto", payload)
+    return _fan_out("sendPhoto", payload, audience=audience)
 
 
 def send_album(photo_urls: list[str], caption: str = "", topic: str = "",
-               dry_run: bool = False) -> bool:
+               dry_run: bool = False, audience: str = "") -> bool:
     """A carousel preview, as Telegram sees it. Max 10 per album."""
     if not enabled() or not photo_urls:
         return False
@@ -244,7 +262,7 @@ def send_album(photo_urls: list[str], caption: str = "", topic: str = "",
     thread = _topic(topic) if topic else ""
     if thread:
         payload["message_thread_id"] = thread
-    return _fan_out("sendMediaGroup", payload)
+    return _fan_out("sendMediaGroup", payload, audience=audience)
 
 
 def alert(agent: str, exc: BaseException, context: str = "") -> bool:
