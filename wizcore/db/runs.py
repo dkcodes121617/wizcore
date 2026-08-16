@@ -78,6 +78,7 @@ def run_scope(
                 "ON CONFLICT (run_id) DO NOTHING",
                 (rec.run_id, agent),
             )
+            _abandon_stale(conn, agent)
     except Exception:  # noqa: BLE001
         # Never let bookkeeping stop the work. A run that did its job but could
         # not record that it did is strictly better than a run that refused to
@@ -103,6 +104,40 @@ def run_scope(
                 )
         except Exception:  # noqa: BLE001
             log.warning("could not close agent_runs row", exc_info=True)
+
+
+#: Longer than any real run. The slowest agent (Lead Finder, all sources) sits
+#: around 9 minutes against a 15 minute Modal timeout, so a row still 'running'
+#: after four hours cannot be a run that is merely slow.
+STALE_RUN_HOURS = 4
+
+
+def _abandon_stale(conn, agent: str) -> None:
+    """Close out rows this agent left in 'running' after being killed.
+
+    Modal preempts containers. The signal it sends surfaces as a
+    KeyboardInterrupt wherever the run happens to be — often inside a query,
+    where `run_scope`'s finally block cannot complete either. The row stays
+    'running' forever.
+
+    That matters because 'stuck run' is an alert. Left alone, one preemption
+    reports itself in the digest and on the dashboard every day from now on, and
+    an alert that never clears is one you learn to scroll past — which costs you
+    the next real one. So the row is closed, but to 'aborted' rather than
+    deleted: the run genuinely did not finish, and that stays on the record.
+
+    Scoped to `agent` so one agent can never close another's in-flight run, and
+    never touches the row just inserted above.
+    """
+    execute(
+        conn,
+        "UPDATE core.agent_runs "
+        "   SET status = 'aborted', finished_at = now(), "
+        "       error = coalesce(error, 'no terminal status; container was killed mid-run') "
+        " WHERE agent = %s AND status = 'running' "
+        "   AND started_at < now() - make_interval(hours => %s)",
+        (agent, STALE_RUN_HOURS),
+    )
 
 
 def _json(obj) -> str:
