@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import time
 from collections.abc import Callable
@@ -30,7 +31,8 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
+    stop_after_delay,
+    wait_exponential_jitter,
 )
 
 from wizcore.config import env_str
@@ -52,7 +54,84 @@ class LLMError(RuntimeError):
 
 
 class LLMTransient(RuntimeError):
-    """A retryable problem (timeout, 5xx, rate limit, WAF hiccup)."""
+    """A retryable problem (timeout, 5xx, 529 overloaded, rate limit, WAF hiccup).
+
+    Carries `retry_after` when the server said how long to wait. Guessing a
+    backoff when the server has already told you the answer is how a 429 turns
+    into five more 429s.
+    """
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+# Retryable HTTP statuses.
+#
+# 529 `overloaded_error` is the one that matters and the one that was missing:
+# it is Anthropic's "capacity reached, come back shortly" and is explicitly
+# retryable, but it fell through to the permanent branch below and aborted the
+# run on the first occurrence. 408/409/425 are the same class of "try again"
+# that the official SDKs retry.
+_RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+
+#: Ceiling on a single sleep. A server may legitimately ask for minutes on a
+#: daily-quota 429; waiting that long inside a scheduled run is worse than
+#: giving up and letting the next tick retry.
+_MAX_SLEEP = 60.0
+
+#: Total wall-clock budget for one completion, across every attempt.
+#:
+#: The agents run on Modal with a 900s function timeout. Without a deadline,
+#: 5 attempts x a 300s read timeout plus backoff can exceed that on its own, so
+#: one unlucky call would consume the entire run and be killed mid-write. This
+#: bounds a call to a bit over four minutes so the run always keeps enough time
+#: to finish and record what it did.
+_DEADLINE = 260.0
+
+
+def _retry_after(resp) -> float | None:
+    """The server's own answer to "when should I come back?", in seconds.
+
+    `Retry-After` is either a delta in seconds or an HTTP date; only the delta
+    form is worth parsing here, and an unparseable value simply means we fall
+    back to exponential backoff rather than crash inside error handling.
+    """
+    raw = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+_BACKOFF = wait_exponential_jitter(initial=3, max=_MAX_SLEEP, exp_base=2, jitter=3)
+
+
+def _wait_for_retry(state) -> float:
+    """Obey `Retry-After` when given; otherwise exponential backoff with jitter.
+
+    The jitter is not decoration. The classifier fans several completions out at
+    once, so a fixed backoff makes every one of them wake and retry in the same
+    instant — re-creating the burst that caused the 429 in the first place.
+    """
+    exc = state.outcome.exception() if state.outcome else None
+    server_says = getattr(exc, "retry_after", None)
+    if server_says is not None:
+        return min(server_says + random.uniform(0, 1.0), _MAX_SLEEP)
+    return _BACKOFF(state)
+
+
+def _log_retry(state) -> None:
+    """Make retries visible. A silent retry storm looks exactly like slowness."""
+    exc = state.outcome.exception() if state.outcome else None
+    log.warning(
+        "llm retry %d after %.1fs: %s",
+        state.attempt_number,
+        state.idle_for,
+        str(exc)[:200],
+    )
 
 
 class LLMClient:
@@ -91,20 +170,24 @@ class LLMClient:
     # ── low-level ──
     @retry(
         retry=retry_if_exception_type(LLMTransient),
-        # The proxy has brief 502/gateway spells that clear within a minute or two.
-        # 5 attempts with backoff up to 40s rides through them without stalling for
-        # long. A truly persistent outage still gives up and aborts the run cleanly.
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=3, max=40),
+        # Whichever comes first: a handful of attempts, or the wall-clock
+        # budget. Attempts alone are not a bound when each one can block for
+        # minutes, and a deadline alone would allow a tight spin on fast
+        # failures — the pair is what makes the worst case predictable.
+        stop=(stop_after_attempt(6) | stop_after_delay(_DEADLINE)),
+        wait=_wait_for_retry,
         reraise=True,
+        before_sleep=_log_retry,
     )
     def _post(self, payload: dict) -> dict:
         url = f"{self.base_url}/v1/messages"
-        # (connect timeout, read timeout). This proxy is legitimately slow on long
-        # generations (~30-70s is normal), so the read timeout is generous — but
-        # bounded so a truly hung connection fails instead of blocking for minutes.
+        # (connect timeout, read timeout). The proxy is legitimately slow — a
+        # minute or more on a long generation is normal and is NOT a failure, so
+        # the read timeout is deliberately generous. Cutting it short would turn
+        # a working slow call into a retry storm that is slower still and costs
+        # a second generation each time.
         try:
-            resp = self._session.post(url, data=json.dumps(payload), timeout=(10, 150))
+            resp = self._session.post(url, data=json.dumps(payload), timeout=(10, 300))
         except requests.RequestException as e:
             raise LLMTransient(f"network error: {e}") from e
 
@@ -113,8 +196,11 @@ class LLMClient:
 
         body = resp.text[:400]
         # 1010 = Cloudflare WAF; usually transient / UA-related but retry can clear it.
-        if resp.status_code in (429, 500, 502, 503, 504) or "1010" in body:
-            raise LLMTransient(f"HTTP {resp.status_code}: {body}")
+        if resp.status_code in _RETRYABLE_STATUS or "1010" in body:
+            raise LLMTransient(
+                f"HTTP {resp.status_code}: {body}",
+                retry_after=_retry_after(resp),
+            )
         if resp.status_code in (401, 403):
             raise LLMError(f"auth/forbidden HTTP {resp.status_code}: {body}")
         raise LLMError(f"HTTP {resp.status_code}: {body}")
