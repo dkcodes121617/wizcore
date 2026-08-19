@@ -5,33 +5,33 @@ only question was when it would fill, not whether.
 
 ## What actually grows
 
-Measured, not assumed. At 44 MB total:
+Measured, not assumed. Two readings a day apart:
 
-    lf_ckpt (LangGraph checkpoints, Lead Finder)   29 MB   66%
-    everything else combined                       15 MB
+    18 Aug   44 MB total,  lf_ckpt 29 MB   (66%)
+    19 Aug   69 MB total,  lf_ckpt 50 MB   (72%)
 
 The checkpointer writes one row per node per run to `checkpoints`,
 `checkpoint_blobs` and `checkpoint_writes`. The Lead Finder runs 48 times a day
 and carries a few hundred candidates through the graph, so the blobs are large
-and constant. That is roughly 3 MB a day, which reaches 500 MB in about five
-months and would then stop every agent at once.
+and constant. That is ~21 MB a day, not the 3 MB first estimated — which would
+reach the 500 MB cap in about three weeks and stop every agent at once.
 
 ## Why checkpoints are safe to delete and leads are not
 
 A checkpoint exists to resume an interrupted run. Once a run has a terminal
 status in `core.agent_runs` it will never be resumed — the next tick starts a
 new `thread_id`. So a checkpoint belonging to a finished run is dead weight the
-moment the run ends, and this deliberately keeps a week of them anyway so a
-recent failure can still be inspected.
+moment the run ends. See CHECKPOINT_DAYS for why the window is two days rather
+than the week originally chosen.
 
 The business data is not touched. Leads, entities, posts, outreach and the spend
 ledger are the record of what the system did and are small: `core.leads` is
-under a megabyte at 642 rows. Deleting those to save space would be trading the
-thing you are paying to keep for the thing you are paying to throw away.
+under 3 MB at 811 rows. Deleting those to save space would be trading the thing
+you are paying to keep for the thing you are paying to throw away.
 
-`content.trend_items` is the one exception worth pruning — 741 rows of raw
-firehose at 1 MB, of which the rejected ones have already served their purpose
-by the time anyone reads them.
+`content.trend_items` is the one exception worth pruning — raw firehose, of
+which the rejected ones have already served their purpose by the time anyone
+reads them.
 """
 from __future__ import annotations
 
@@ -41,8 +41,21 @@ from wizcore.db.conn import connect, fetch_one
 
 log = logging.getLogger("wizcore.db.retention")
 
-#: A week. Long enough that a Friday failure is still inspectable on Monday.
-CHECKPOINT_DAYS = 7
+#: Two days.
+#:
+#: Seven was the first guess and it was wrong for a reason worth recording: it
+#: was chosen so "a Friday failure is still inspectable on Monday", but you
+#: inspect a failure through `core.agent_runs.error`, which is kept for six
+#: months. A checkpoint is graph state for RESUMING a run, not diagnostics —
+#: and nothing here resumes. The Lead Finder has no interrupt() and simply runs
+#: again 30 minutes later, so a checkpoint is worthless within the hour.
+#:
+#: The measurement that forced the change: lf_ckpt grew 29 MB -> 50 MB in a
+#: single day. At 21 MB/day a seven-day window settles around 150 MB of pure
+#: dead weight against Neon's 500 MB cap; two days settles near 40 MB. On the
+#: day this was tightened, 7 days made 0 of 1240 checkpoints eligible and
+#: 2 days made 497 — the job was running and deleting nothing.
+CHECKPOINT_DAYS = 2
 
 #: Rejected trend items are kept long enough to audit the classifier, no longer.
 TREND_REJECTED_DAYS = 14
@@ -80,7 +93,7 @@ def prune(database_url: str, dry_run: bool = False) -> dict[str, int]:
 
 
 def _prune_checkpoints(conn, schema: str, agent: str, dry_run: bool) -> dict[str, int]:
-    """Drop checkpoints for runs that reached a terminal status a week ago.
+    """Drop checkpoints for runs that reached a terminal status CHECKPOINT_DAYS ago.
 
     Anchored to `core.agent_runs.finished_at` rather than to anything inside the
     checkpoint tables, because LangGraph does not store a plain timestamp and

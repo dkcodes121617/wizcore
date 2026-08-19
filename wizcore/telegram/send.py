@@ -196,32 +196,93 @@ def send(text: str, topic: str = "", dry_run: bool = False, silent: bool = False
     return ok
 
 
-def _chunks(text: str) -> list[str]:
-    """Split on line boundaries where possible, never mid-HTML-tag.
+#: Formatting tags Telegram accepts that can span a chunk boundary. A message
+#: split between the opener and closer is rejected outright, not degraded.
+_SPANNING_TAGS = ("pre", "code", "b", "i", "u", "s", "blockquote")
 
-    Splitting a message at a fixed offset can cut an <b> from its </b>, and
-    Telegram rejects the whole message with a 400 rather than rendering it
-    plainly — so the split has to respect line boundaries.
+
+def _open_tags(fragment: str) -> list[str]:
+    """Tags opened in `fragment` and not yet closed, outermost first."""
+    import re as _re
+
+    stack: list[str] = []
+    for match in _re.finditer(r"<(/?)([a-zA-Z]+)[^>]*>", fragment):
+        closing, name = match.group(1), match.group(2).lower()
+        if name not in _SPANNING_TAGS:
+            continue
+        if closing:
+            # Unwind to the matching opener; malformed nesting is tolerated
+            # because this runs on model-generated text, not on our own markup.
+            if name in stack:
+                while stack and stack.pop() != name:
+                    pass
+        else:
+            stack.append(name)
+    return stack
+
+
+def _balance(chunk: str, carry: list[str]) -> tuple[str, list[str]]:
+    """Reopen tags inherited from the previous chunk, close whatever is left open.
+
+    Telegram parses every chunk as a standalone message. A `<pre>` block that
+    starts in chunk 1 and ends in chunk 2 therefore produces two 400s — one for
+    the unclosed opener, one for the orphan closer — and BOTH messages are
+    dropped. Measured in production: the Outreach hand-over on 18 Aug produced
+    nine drafts and delivered none of them, because each draft is wrapped in
+    <pre> and ran past the chunk size.
+
+    Splitting on line boundaries, which is what this did before, does not help:
+    a <pre> block is many lines.
+    """
+    prefix = "".join(f"<{tag}>" for tag in carry)
+    body = prefix + chunk
+    still_open = _open_tags(body)
+    suffix = "".join(f"</{tag}>" for tag in reversed(still_open))
+    return body + suffix, still_open
+
+
+def _chunks(text: str) -> list[str]:
+    """Split to Telegram's limit, keeping every chunk valid HTML on its own.
+
+    Telegram validates each chunk as a standalone message, so a <pre> block
+    spanning a boundary yields two 400s and BOTH messages are dropped. Splitting
+    on line boundaries — which is all this used to do — does not help, because a
+    <pre> block is many lines.
+
+    So each chunk is balanced: tags still open at its end are closed, and
+    reopened at the start of the next. That ADDS bytes, and a chunk sized to the
+    limit before balancing is over the limit after it. Rather than predict the
+    overhead (it depends on tags opened inside the slice, not just carried into
+    it), the slice is shrunk until the balanced result actually fits. Measuring
+    beats estimating, and the loop below always makes progress.
     """
     if len(text) <= _MAX:
         return [text]
-    out, current = [], ""
-    for line in text.split("\n"):
-        # A single line longer than a chunk is rare (a URL, a base64 blob) and
-        # has to be hard-split; there is no safe boundary inside it.
-        while len(line) > _CHUNK:
-            if current:
-                out.append(current)
-                current = ""
-            out.append(line[:_CHUNK])
-            line = line[_CHUNK:]
-        if len(current) + len(line) + 1 > _CHUNK:
-            out.append(current)
-            current = line
-        else:
-            current = f"{current}\n{line}" if current else line
-    if current:
-        out.append(current)
+
+    out: list[str] = []
+    carry: list[str] = []
+    pos = 0
+
+    while pos < len(text):
+        take = _CHUNK
+        while True:
+            stop = min(len(text), pos + take)
+            # Prefer a line boundary so a split never lands mid-tag.
+            if stop < len(text):
+                nl = text.rfind("\n", pos, stop)
+                if nl > pos:
+                    stop = nl
+            balanced, next_carry = _balance(text[pos:stop], carry)
+            # 256 is the floor: below it, pathological nesting would shrink the
+            # allowance forever and never emit anything.
+            if len(balanced) <= _MAX or take <= 256:
+                break
+            take = int(take * 0.85)
+        out.append(balanced)
+        carry = next_carry
+        # Guarantee forward progress even if the slice collapsed to nothing.
+        pos = stop if stop > pos else pos + 1
+
     return out
 
 
