@@ -48,6 +48,18 @@ _USER_AGENT = "claude-cli/1.0.0 (external, cli)"
 _CACHE_MIN_CHARS = 2000
 _ANTHROPIC_VERSION = "2023-06-01"
 
+# Models the proxy rejects outright when `temperature` is set. Measured on
+# LLMsRelay 2026-11-24: sonnet-5-5 and haiku-5-5 refuse it with a generic 400,
+# while opus-5-5 accepts it. Callers keep passing a temperature (it is still
+# meaningful for the 4.x models they fall back to); it is dropped here.
+_NO_TEMPERATURE = ("claude-sonnet-5-5", "claude-haiku-5-5")
+
+
+def accepts_temperature(model: str) -> bool:
+    """False for models that reject the `temperature` parameter."""
+    m = (model or "").lower()
+    return not any(m.startswith(prefix) for prefix in _NO_TEMPERATURE)
+
 
 class LLMError(RuntimeError):
     """A non-retryable problem talking to the proxy (auth, bad request, etc.)."""
@@ -235,11 +247,23 @@ class LLMClient:
             "system": system_field,
             "messages": [{"role": "user", "content": user}],
         }
-        if temperature is not None:
+        if temperature is not None and accepts_temperature(payload["model"]):
             payload["temperature"] = temperature
 
         t0 = time.time()
-        data = self._post(payload)
+        try:
+            data = self._post(payload)
+        except LLMError as e:
+            # A model that refuses `temperature` answers with a generic 400
+            # ("The model rejected the request"), not a parameter error, so it
+            # cannot be told apart from a bad prompt except by retrying once
+            # without it. The retry is only ever made when temperature was sent.
+            if "temperature" not in payload or "HTTP 400" not in str(e):
+                raise
+            log.warning("model %s rejected the request with temperature set; "
+                        "retrying once without it", payload["model"])
+            payload.pop("temperature")
+            data = self._post(payload)
         dt = time.time() - t0
 
         text = "".join(
