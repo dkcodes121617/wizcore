@@ -1,6 +1,12 @@
-"""Telegram — send-only.
+"""Telegram — sending, plus the legacy command poller.
 
-**There is no webhook anywhere in this system.** Approvals were removed
+**Update (2026-11-26):** the bot now has one webhook, lead_finder's Telegram
+assistant (`lead_finder_agent/pipeline/assistant.py`). It applies every command
+and drafts the next message when the owner swipe-replies to a lead alert.
+While it is set, `poll_commands` returns nothing (Telegram answers getUpdates
+with 409). The history below explains why polling was chosen originally.
+
+**There was no webhook in this system before that.** Approvals were removed
 deliberately, and with no callback buttons a bot needs no public HTTPS endpoint,
 no router, and no one-webhook-per-bot coordination between agents. Telegram
 carries exactly three things:
@@ -368,7 +374,13 @@ def poll_commands(offset_file: str | None = None, limit: int = 40) -> list[dict]
              "allowed_updates": '["message"]'},
             attempts=2,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        if "409" in str(e):
+            # A webhook is set (lead_finder's Telegram assistant), so Telegram
+            # delivers every update there and getUpdates is off for everyone.
+            # The assistant applies the commands; nothing to poll here.
+            log.debug("getUpdates unavailable: a webhook is active")
+            return []
         log.warning("getUpdates failed", exc_info=True)
         return []
 
